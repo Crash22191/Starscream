@@ -49,6 +49,7 @@ public enum ErrorType: Error {
     case protocolError //There was an error parsing the WebSocket frames
     case upgradeError //There was an error during the HTTP upgrade
     case closeError //There was an error during the close (socket probably has been dereferenced)
+    case osError // There was an error with the underlying OS
 }
 
 public struct WSError: Error {
@@ -69,6 +70,7 @@ public protocol WebSocketClient: class {
     #else
     var security: SSLTrustValidator? {get set}
     var enabledSSLCipherSuites: [SSLCipherSuite]? {get set}
+    var socketSecurityLevel: StreamSocketSecurityLevel { get set }
     #endif
     var isConnected: Bool {get}
     
@@ -113,6 +115,7 @@ public struct SSLSettings {
     #if os(Linux)
     #else
     public let cipherSuites: [SSLCipherSuite]?
+    public var socketSecurityLevel: StreamSocketSecurityLevel
     #endif
 }
 
@@ -140,8 +143,8 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
     private var outputStream: OutputStream?
     public weak var delegate: WSStreamDelegate?
     let BUFFER_MAX = 4096
-	
-	public var enableSOCKSProxy = false
+    
+    public var enableSOCKSProxy = false
     
     public func connect(url: URL, port: Int, timeout: TimeInterval, ssl: SSLSettings, completion: @escaping ((Error?) -> Void)) {
         var readStream: Unmanaged<CFReadStream>?
@@ -166,8 +169,8 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
         inStream.delegate = self
         outStream.delegate = self
         if ssl.useSSL {
-            inStream.setProperty(StreamSocketSecurityLevel.negotiatedSSL as AnyObject, forKey: Stream.PropertyKey.socketSecurityLevelKey)
-            outStream.setProperty(StreamSocketSecurityLevel.negotiatedSSL as AnyObject, forKey: Stream.PropertyKey.socketSecurityLevelKey)
+            inStream.setProperty(ssl.socketSecurityLevel as AnyObject, forKey: Stream.PropertyKey.socketSecurityLevelKey)
+            outStream.setProperty(ssl.socketSecurityLevel as AnyObject, forKey: Stream.PropertyKey.socketSecurityLevelKey)
             #if os(watchOS) //watchOS us unfortunately is missing the kCFStream properties to make this work
             #else
                 var settings = [NSObject: NSObject]()
@@ -416,6 +419,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
     #else
     public var security: SSLTrustValidator?
     public var enabledSSLCipherSuites: [SSLCipherSuite]?
+    public var socketSecurityLevel: StreamSocketSecurityLevel = .negotiatedSSL
     #endif
     
     public var isConnected: Bool {
@@ -433,7 +437,6 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
 
     private struct CompressionState {
         var supportsCompression = false
-        var messageNeedsDecompression = false
         var serverMaxWindowBits = 15
         var clientMaxWindowBits = 15
         var clientNoContextTakeover = false
@@ -447,6 +450,10 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
     private var isConnecting = false
     private let mutex = NSLock()
     private var compressionState = CompressionState()
+    // `currentMessageNeedsDecompression` is not part of the `compressionState` struct
+    // because currentMessageNeedsDecompression can be mutated in the read queue concurrently
+    // with other `compressionState` fields being accesseed on the write queue.
+    private var currentMessageNeedsDecompression = false
     private var writeQueue = OperationQueue()
     private var readStack = [WSResponse]()
     private var inputQueue = [Data]()
@@ -589,8 +596,8 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
         }
         request.setValue(headerWSUpgradeValue, forHTTPHeaderField: headerWSUpgradeName)
         request.setValue(headerWSConnectionValue, forHTTPHeaderField: headerWSConnectionName)
-        headerSecKey = generateWebSocketKey()
         request.setValue(headerWSVersionValue, forHTTPHeaderField: headerWSVersionName)
+        headerSecKey = try! generateWebSocketKey()
         request.setValue(headerSecKey, forHTTPHeaderField: headerWSKeyName)
         
         if enableCompression {
@@ -627,16 +634,16 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
     /**
      Generate a WebSocket key as needed in RFC.
      */
-    private func generateWebSocketKey() -> String {
-        var key = ""
-        let seed = 16
-        for _ in 0..<seed {
-            let uni = UnicodeScalar(UInt32(97 + arc4random_uniform(25)))
-            key += "\(Character(uni!))"
+    private func generateWebSocketKey() throws -> String {
+        let kSocketKeyByteLength = 16
+        var randomData = Data(count: kSocketKeyByteLength)
+        try randomData.withUnsafeMutableBytes { (bytes: UnsafeMutablePointer<UInt8>) throws -> Void in
+            guard SecRandomCopyBytes(kSecRandomDefault, kSocketKeyByteLength, bytes) == errSecSuccess else {
+                throw WSError(type: .osError, message: "unable to generate random bytes", code: 0)
+            }
         }
-        let data = key.data(using: String.Encoding.utf8)
-        let baseKey = data?.base64EncodedString(options: NSData.Base64EncodingOptions(rawValue: 0))
-        return baseKey!
+
+        return randomData.base64EncodedString()
     }
 
     /**
@@ -657,15 +664,16 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             let settings = SSLSettings(useSSL: useSSL,
                                        disableCertValidation: disableSSLCertValidation,
                                        overrideTrustHostname: overrideTrustHostname,
-                                       desiredTrustHostname: desiredTrustHostname),
-                                       sslClientCertificate: sslClientCertificate
+                                       desiredTrustHostname: desiredTrustHostname,
+                                       sslClientCertificate: sslClientCertificate)
         #else
             let settings = SSLSettings(useSSL: useSSL,
                                        disableCertValidation: disableSSLCertValidation,
                                        overrideTrustHostname: overrideTrustHostname,
                                        desiredTrustHostname: desiredTrustHostname,
                                        sslClientCertificate: sslClientCertificate,
-                                       cipherSuites: self.enabledSSLCipherSuites)
+                                       cipherSuites: enabledSSLCipherSuites,
+                                       socketSecurityLevel: socketSecurityLevel)
         #endif
         certValidated = !useSSL
         let timeout = request.timeoutInterval * 1_000_000
@@ -996,9 +1004,9 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             let payloadLen = (PayloadLenMask & baseAddress[1])
             var offset = 2
             if compressionState.supportsCompression && receivedOpcode != .continueFrame {
-                compressionState.messageNeedsDecompression = (RSV1Mask & baseAddress[0]) > 0
+                currentMessageNeedsDecompression = (RSV1Mask & baseAddress[0]) > 0
             }
-            if (isMasked > 0 || (RSVMask & baseAddress[0]) > 0) && receivedOpcode != .pong && !compressionState.messageNeedsDecompression {
+            if (isMasked > 0 || (RSVMask & baseAddress[0]) > 0) && receivedOpcode != .pong && !currentMessageNeedsDecompression {
                 let errCode = CloseCode.protocolError.rawValue
                 doDisconnect(WSError(type: .protocolError, message: "masked and rsv data is not currently supported", code: Int(errCode)))
                 writeError(errCode)
@@ -1059,7 +1067,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
                 len -= UInt64(size)
             }
             let data: Data
-            if compressionState.messageNeedsDecompression, let decompressor = compressionState.decompressor {
+            if currentMessageNeedsDecompression, let decompressor = compressionState.decompressor {
                 do {
                     data = try decompressor.decompress(bytes: baseAddress+offset, count: Int(len), finish: isFin > 0)
                     if isFin > 0 && compressionState.serverNoContextTakeover {
@@ -1250,7 +1258,10 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             }
             buffer[1] |= self.MaskMask
             let maskKey = UnsafeMutablePointer<UInt8>(buffer + offset)
-            _ = SecRandomCopyBytes(kSecRandomDefault, Int(MemoryLayout<UInt32>.size), maskKey)
+            guard SecRandomCopyBytes(kSecRandomDefault, Int(MemoryLayout<UInt32>.size), maskKey) == errSecSuccess else {
+                self.doDisconnect(WSError(type: .osError, message: "unable to generate random bytes", code: 0))
+                return
+            }
             offset += MemoryLayout<UInt32>.size
 
             for i in 0..<dataLength {

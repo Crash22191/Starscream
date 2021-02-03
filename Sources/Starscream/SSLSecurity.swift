@@ -149,7 +149,10 @@ open class SSLSecurity : SSLTrustValidator {
         } else {
             policy = SecPolicyCreateBasicX509()
         }
-        SecTrustSetPolicies(trust,policy)
+        guard SecTrustSetPolicies(trust, policy) == errSecSuccess else {
+            assertionFailure("unable to set trust policies")
+            return false
+        }
         if self.usePublicKeys {
             if let keys = self.pubKeys {
                 let serverPubKeys = publicKeyChain(trust)
@@ -161,22 +164,41 @@ open class SSLSecurity : SSLTrustValidator {
                     }
                 }
             }
-        } else if let certs = self.certificates {
-            let serverCerts = certificateChain(trust)
+        }
+        else if let pinnedCerts = self.certificates {
+            // First try a direct compare of the server cert against our pinned certs
+            guard let serverCert = SecTrustGetCertificateAtIndex( trust, 0 ) else { return false }
+            let serverCertData = SecCertificateCopyData( serverCert ) as NSData
+            for cert in pinnedCerts
+            {
+                if ( serverCertData.isEqual(to: cert as Data) )
+                {
+                    return true
+                }
+            }
+            
+            // Then try to verify the server cert against a pinned cert as CA
             var collect = [SecCertificate]()
-            for cert in certs {
+            for cert in pinnedCerts {
                 collect.append(SecCertificateCreateWithData(nil,cert as CFData)!)
             }
-            SecTrustSetAnchorCertificates(trust,collect as NSArray)
+            guard SecTrustSetAnchorCertificates(trust, collect as NSArray) == errSecSuccess else {
+                assertionFailure("unable to set trust anchor certificates")
+                return false
+            }
             var result: SecTrustResultType = .unspecified
-            SecTrustEvaluate(trust,&result)
+            guard SecTrustEvaluate(trust, &result) == errSecSuccess else {
+                assertionFailure("unable to evaluate trust")
+                return false
+            }
             if result == .unspecified || result == .proceed {
                 if !validateEntireChain {
                     return true
                 }
                 var trustedCount = 0
+                let serverCerts = certificateChain(trust)                
                 for serverCert in serverCerts {
-                    for cert in certs {
+                    for cert in pinnedCerts {
                         if cert == serverCert {
                             trustedCount += 1
                             break
@@ -213,11 +235,17 @@ open class SSLSecurity : SSLTrustValidator {
     */
     public func extractPublicKey(_ cert: SecCertificate, policy: SecPolicy) -> SecKey? {
         var possibleTrust: SecTrust?
-        SecTrustCreateWithCertificates(cert, policy, &possibleTrust)
+        guard SecTrustCreateWithCertificates(cert, policy, &possibleTrust) == errSecSuccess else {
+            assertionFailure("failed to create trust with certificate")
+            return nil
+        }
         
         guard let trust = possibleTrust else { return nil }
         var result: SecTrustResultType = .unspecified
-        SecTrustEvaluate(trust, &result)
+        guard SecTrustEvaluate(trust, &result) == errSecSuccess else {
+            assertionFailure("failed to evaluate trust")
+            return nil
+        }
         return SecTrustCopyPublicKey(trust)
     }
     
